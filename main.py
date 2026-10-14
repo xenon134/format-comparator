@@ -29,8 +29,7 @@ import threading
 import time
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from formats import FormatSpec, get_registered_formats
 from optimizer import (
@@ -47,8 +46,18 @@ def format_byte_size(num_bytes: float) -> str:
     if b < 1024:
         return f"{int(round(b))} B"
     if b < 1024 * 1024:
-        return f"{b / 1024.0:.2f} KB ({int(round(b)):,} B)"
-    return f"{b / (1024.0 * 1024.0):.2f} MB ({int(round(b)):,} B)"
+        return f"{b / 1024.0:.2f} KB"
+    return f"{b / (1024.0 * 1024.0):.2f} MB"
+
+
+def format_shortfall(num_bytes: float) -> str:
+    """Format how far `num_bytes` is short of a target as B / KB / MB."""
+    b = max(0.0, float(num_bytes))
+    if b < 1024:
+        return f"{int(round(b))} B"
+    if b < 1024 * 1024:
+        return f"{b / 1024.0:.2f} KB"
+    return f"{b / (1024.0 * 1024.0):.2f} MB"
 
 
 def parse_size_input(text: str, max_bytes: int) -> Optional[int]:
@@ -77,64 +86,17 @@ def parse_size_input(text: str, max_bytes: int) -> Optional[int]:
         return None
 
 
-def generate_demo_image(width: int = 384, height: int = 256) -> Tuple[Image.Image, int]:
-    """
-    Synthesize a rich photographic + geometric test image (smooth gradients,
-    high-frequency edges, color wheel rings, and fine text) when no input file
-    is provided on the command line.
-
-    Returns:
-        `(pil_image, baseline_file_size_bytes)`
-    """
-    x = np.linspace(0, 1, width, dtype=np.float32)
-    y = np.linspace(0, 1, height, dtype=np.float32)
-    xx, yy = np.meshgrid(x, y)
-
-    # Smooth sky-to-sunset gradient + radial cosine ripples
-    cx, cy = 0.35, 0.45
-    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    ripple = 0.5 + 0.5 * np.cos(dist * 38.0)
-
-    r = np.clip(40 + 185 * (1.0 - yy * 0.7) + 30 * ripple, 0, 255)
-    g = np.clip(65 + 140 * xx + 45 * np.sin(xx * 18.0) * np.cos(yy * 18.0), 0, 255)
-    b = np.clip(110 + 135 * yy + 35 * (1.0 - ripple), 0, 255)
-
-    arr = np.stack([r, g, b], axis=-1).astype(np.uint8)
-    img = Image.fromarray(arr, mode="RGB")
-
-    # Add sharp geometric shapes and fine detail overlay to test ringing/blocking
-    draw = ImageDraw.Draw(img)
-    draw.rectangle(
-        [width - 135, 22, width - 18, 128],
-        fill=(24, 30, 44),
-        outline=(240, 245, 255),
-        width=2,
-    )
-    for i in range(6):
-        bar_x = width - 125 + i * 17
-        color = (
-            (255 if i in (0, 1, 4) else 45),
-            (235 if i in (1, 2, 3) else 55),
-            (250 if i in (3, 4, 5) else 40),
-        )
-        draw.rectangle([bar_x, 34, bar_x + 12, 95], fill=color)
-    draw.text((width - 124, 103), "SHARP EDGE TEST", fill=(255, 255, 255))
-    draw.ellipse(
-        [26, height - 96, 106, height - 16],
-        fill=(235, 85, 65),
-        outline=(255, 255, 255),
-        width=3,
-    )
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=False)
-    return img, len(buf.getvalue())
+def load_random_image_from_folder() -> Optional[Tuple[Image.Image, int, str]]:
+    import PILutils
+    img = PILutils.randomPicture()
+    return img, max(256, os.path.getsize(img.filename)), os.path.basename(img.filename)
 
 
 def load_image_and_size(path: Optional[str]) -> Tuple[Image.Image, int, str]:
     """
-    Load an input image from `path` (or synthesize a demo image if `path` is None)
-    and return `(image, input_file_size_bytes, display_label)`.
+    Load an input image from `path`. If `path` is None or missing, pick a
+    random image from the placeholder folder (see `load_random_image_from_folder`).
+    Returns `(image, input_file_size_bytes, display_label)`.
     """
     if path and os.path.isfile(path):
         file_bytes = os.path.getsize(path)
@@ -143,8 +105,13 @@ def load_image_and_size(path: Optional[str]) -> Tuple[Image.Image, int, str]:
         if img.mode not in ("RGB", "RGBA"):
             img = img.convert("RGBA" if "A" in img.mode else "RGB")
         return img, max(256, file_bytes), os.path.basename(path)
-    img, size_bytes = generate_demo_image()
-    return img, size_bytes, "Built-in Synthetic Test Image (384×256)"
+    random_img = load_random_image_from_folder()
+    if random_img is not None:
+        return random_img
+    raise FileNotFoundError(
+        "No input image supplied and no random image found in "
+        f"{PLACEHOLDER_IMAGE_FOLDER}. Pass an image path explicitly."
+    )
 
 
 # ============================================================================
@@ -216,7 +183,6 @@ class FormatCompareApp:
         self.slider_var = tk.IntVar(value=default_budget)
         self.entry_var = tk.StringVar(value=f"{default_budget / 1024.0:.2f} KB")
         self.objective_var = tk.StringVar(value="closest_size")
-        self.upscale_mode_var = tk.StringVar(value="NEAREST")
         self.status_var = tk.StringVar(value="Ready.")
 
         self._result_queue: "queue.Queue[Tuple[int, OptimizationResult, bool]]" = queue.Queue()
@@ -403,25 +369,6 @@ class FormatCompareApp:
                 font=("Helvetica", 9),
             )
             btn.pack(side=tk.LEFT, padx=2)
-
-        # Upscale Filter selector
-        tk.Label(
-            controls_row,
-            text="  Upscale View:",
-            font=("Helvetica", 9),
-            fg=self.FG_SECONDARY,
-            bg=self.BG_PANEL,
-        ).pack(side=tk.LEFT, padx=(10, 4))
-
-        upscale_menu = ttk.Combobox(
-            controls_row,
-            textvariable=self.upscale_mode_var,
-            values=["NEAREST", "BILINEAR"],
-            width=9,
-            state="readonly",
-        )
-        upscale_menu.pack(side=tk.LEFT)
-        upscale_menu.bind("<<ComboboxSelected>>", lambda _e: self._refresh_all_previews())
 
         # Objective selector
         tk.Label(
@@ -932,11 +879,7 @@ class FormatCompareApp:
         disp_w = max(1, int(round(src_w * fit_ratio)))
         disp_h = max(1, int(round(src_h * fit_ratio)))
 
-        resample = (
-            Image.Resampling.NEAREST
-            if self.upscale_mode_var.get() == "NEAREST"
-            else Image.Resampling.BILINEAR
-        )
+        resample = Image.Resampling.BICUBIC
         disp_img = decoded_img.convert("RGB").resize((disp_w, disp_h), resample=resample)
         return self.ImageTk.PhotoImage(disp_img)
 
@@ -969,18 +912,19 @@ class FormatCompareApp:
             widgets["img_lbl"].configure(image=photo, text="")
 
         if res.within_budget:
+            shortfall = res.target_bytes - res.actual_bytes
             size_text = (
-                f"{res.actual_bytes:,} B / {res.target_bytes:,} B "
-                f"({res.utilization_pct:.1f}%)"
+                f"{format_byte_size(res.actual_bytes)} / {format_byte_size(res.target_bytes)} "
+                f"({format_shortfall(shortfall)} short of target)"
             )
             size_color = (
                 self.ACCENT_GREEN
-                if res.utilization_pct >= 85.0
+                if shortfall <= max(4, int(res.target_bytes * 0.15))
                 else self.ACCENT_AMBER
             )
         else:
             size_text = (
-                f"{res.actual_bytes:,} B (Min floor > {res.target_bytes:,} B)"
+                f"{format_byte_size(res.actual_bytes)} (Min floor > {format_byte_size(res.target_bytes)})"
             )
             size_color = self.ACCENT_RED
 
@@ -1022,7 +966,7 @@ class FormatCompareApp:
         tk.Label(
             hdr,
             text=(
-                f"{res.format_name}  —  {res.actual_bytes:,} B / {res.target_bytes:,} B  "
+                f"{res.format_name}  —  {format_byte_size(res.actual_bytes)} / {format_byte_size(res.target_bytes)}  "
                 f"|  Scaled: {res.scaled_size[0]}×{res.scaled_size[1]}  "
                 f"|  PSNR: {res.psnr_db:.2f} dB  |  {res.format_params_summary()}"
             ),
@@ -1059,10 +1003,13 @@ class FormatCompareApp:
 
         body = tk.Frame(modal, bg=self.BG_MAIN, padx=12, pady=12)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        modal.update_idletasks()
 
-        # Render Original vs Compressed upscaled to 410x410 max box
+        # Fit each pane's image to half the available modal width (minus padding).
+        body_w = max(300, body.winfo_width() - 20)
+        pane_w = max(200, int(body_w / 2) - 20)
         src_w, src_h = self.source_image.size
-        scale_factor = min(410.0 / max(1, src_w), 410.0 / max(1, src_h))
+        scale_factor = min(pane_w / max(1, src_w), pane_w / max(1, src_h))
         disp_size = (
             max(1, int(round(src_w * scale_factor))),
             max(1, int(round(src_h * scale_factor))),
@@ -1073,11 +1020,7 @@ class FormatCompareApp:
         )
         comp_disp = res.decoded_image.convert("RGB").resize(
             disp_size,
-            resample=(
-                Image.Resampling.NEAREST
-                if self.upscale_mode_var.get() == "NEAREST"
-                else Image.Resampling.BILINEAR
-            ),
+            resample=Image.Resampling.BICUBIC,
         )
 
         orig_photo = self.ImageTk.PhotoImage(orig_disp)
@@ -1091,7 +1034,7 @@ class FormatCompareApp:
                     orig_photo,
                 ),
                 (
-                    f"{res.format_name} ({res.scaled_size[0]}×{res.scaled_size[1]}, {res.actual_bytes:,} B)",
+                    f"{res.format_name} ({res.scaled_size[0]}×{res.scaled_size[1]}, {format_byte_size(res.actual_bytes)})",
                     comp_photo,
                 ),
             ]
