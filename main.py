@@ -5,10 +5,11 @@ main.py — Format Compare Visual (Tkinter GUI & CLI Entry Point)
 Opens a Tkinter window with:
   1. A top control bar featuring a file size slider ranging from `0` to the
      input image's file size (plus direct byte/KB entry and quick presets).
-  2. A responsive scrollable grid populated by the input image encoded across
-     all registered formats/codecs in parallel (`formats.py` + `optimizer.py`),
-     automatically tuning codec parameters + resolution `scale` to match the
-     selected file size budget.
+  2. A large single-format display showing one codec at a time (all codecs
+     still optimized in parallel in the background via `formats.py` +
+     `optimizer.py`), with a bottom tab bar of equal-sized codec tabs.
+     Tabs support click-to-view and Left/Right arrow navigation (tabs checked
+     as `skip` in `disabledForNavigation` are skipped by arrows only).
   3. Interactive click-to-inspect modal for side-by-side zoom comparison
      against the original image and one-click export.
 
@@ -159,9 +160,13 @@ class FormatCompareApp:
       - Top control bar with a File Size Slider (`0` .. `input_file_size`),
         direct size entry box (e.g., `2.5 KB`), quick percentage buttons,
         objective selector, and upscale filter toggle.
-      - Responsive multi-column grid displaying each codec's rendered image
-        at the selected byte budget, along with actual size, budget utilization,
-        effective resolution (`scale`), PSNR (dB), and chosen codec options.
+      - Single-codec display showing one optimized result at a time with actual
+        size, budget utilization, effective resolution (`scale`), PSNR (dB),
+        and chosen codec options.
+      - Bottom tab bar with equal-sized codec tabs (click to view) plus a
+        `skip` checkbox per tab and Left/Right arrow navigation. Checked tabs
+        in `disabledForNavigation` are skipped by arrows only (still optimized
+        and clickable).
       - Background worker pool with cooperative cancellation so dragging the
         slider triggers immediate parallel re-optimization without freezing UI.
     """
@@ -218,12 +223,23 @@ class FormatCompareApp:
         self._latest_results: Dict[str, OptimizationResult] = {}
         self._photo_refs: Dict[str, Any] = {}
         self._card_widgets: Dict[str, Dict[str, Any]] = {}
+        # Single-view selection state (UI only; backend still optimizes all formats).
+        self.active_format_id: Optional[str] = (
+            self.formats[0].id if self.formats else None
+        )
+        # When True for a format_id, Left/Right arrow navigation skips that tab.
+        # The format itself is still optimized and still viewable by clicking its tab.
+        self.disabledForNavigation: Dict[str, Any] = {}
+        self._tab_widgets: Dict[str, Dict[str, Any]] = {}
+        self._single_widgets: Dict[str, Any] = {}
         self._debounce_after_id: Optional[str] = None
         self._run_generation_id: int = 0
         self._completed_in_run: int = 0
         self._run_start_time: float = 0.0
-        self._grid_columns: int = 4
-        self._preview_max_size: Tuple[int, int] = (260, 175)
+        # Dynamic preview sizing: no hardcoded pixel box. The preview photo is
+        # re-rendered to fit whatever space the image label currently has.
+        self._last_preview_box: Optional[Tuple[int, int]] = None
+        self._preview_resize_after_id: Optional[str] = None
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -440,140 +456,286 @@ class FormatCompareApp:
         self.status_lbl.pack(side=tk.RIGHT)
 
         # --------------------------------------------------------------------
-        # 2. Scrollable Codec Comparison Grid
+        # 2. Single-Format Display Area (one codec visible at a time)
         # --------------------------------------------------------------------
-        grid_outer = tk.Frame(self.root, bg=self.BG_MAIN)
-        grid_outer.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=(4, 12))
+        display_outer = tk.Frame(self.root, bg=self.BG_MAIN)
+        display_outer.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=(4, 6))
 
-        self.canvas = tk.Canvas(
-            grid_outer, bg=self.BG_MAIN, highlightthickness=0, bd=0
+        self._create_single_view(display_outer)
+
+        # --------------------------------------------------------------------
+        # 3. Bottom Codec Tab Bar (equal-sized tabs, one per codec)
+        # --------------------------------------------------------------------
+        tab_outer = tk.Frame(self.root, bg=self.BG_PANEL, padx=8, pady=8)
+        tab_outer.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 12))
+
+        self.tab_bar = tk.Frame(tab_outer, bg=self.BG_PANEL)
+        self.tab_bar.pack(side=tk.TOP, fill=tk.X, expand=True)
+
+        self._create_tab_bar()
+
+        # Arrow-key navigation between tabs (skips disabledForNavigation tabs).
+        self.root.bind("<Left>", self._on_left_arrow)
+        self.root.bind("<Right>", self._on_right_arrow)
+
+    def _create_single_view(self, parent: Any) -> None:
+        """Create the large single-codec display area."""
+        tk = self.tk
+
+        card = tk.Frame(
+            parent,
+            bg=self.BG_CARD,
+            highlightbackground="#334155",
+            highlightthickness=1,
+            padx=14,
+            pady=10,
         )
-        scrollbar = ttk.Scrollbar(
-            grid_outer, orient=tk.VERTICAL, command=self.canvas.yview
+        card.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # Header: format name + strategy badge
+        hdr = tk.Frame(card, bg=self.BG_CARD)
+        hdr.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+
+        name_lbl = tk.Label(
+            hdr,
+            text="",
+            font=("Helvetica", 13, "bold"),
+            fg=self.FG_PRIMARY,
+            bg=self.BG_CARD,
         )
-        self.grid_container = tk.Frame(self.canvas, bg=self.BG_MAIN)
+        name_lbl.pack(side=tk.LEFT)
 
-        self.grid_container.bind(
-            "<Configure>",
-            lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+        badge_lbl = tk.Label(
+            hdr,
+            text="",
+            font=("Helvetica", 8),
+            fg=self.ACCENT_BLUE,
+            bg="#0f172a",
+            padx=6,
+            pady=2,
         )
-        self._canvas_window = self.canvas.create_window(
-            (0, 0), window=self.grid_container, anchor="nw"
+        badge_lbl.pack(side=tk.RIGHT)
+
+        # Large image area (click to inspect). Fills all free card space;
+        # the photo itself is re-rendered on <Configure> to match the label size.
+        img_lbl = tk.Label(
+            card,
+            bg="#090d16",
+            text="Optimizing...",
+            fg=self.FG_SECONDARY,
+            font=("Helvetica", 10),
+            cursor="hand2",
+            anchor="center",
         )
-        self.canvas.configure(yscrollcommand=scrollbar.set)
+        img_lbl.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=4)
+        img_lbl.bind("<Button-1>", lambda _e: self._open_active_inspector())
+        img_lbl.bind("<Configure>", self._on_preview_resize)
 
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.canvas.bind("<Configure>", self._on_canvas_resize)
+        # Size & budget utilization readout
+        size_lbl = tk.Label(
+            card,
+            text="Size: —",
+            font=("Courier", 11, "bold"),
+            fg=self.ACCENT_GREEN,
+            bg=self.BG_CARD,
+            anchor="w",
+        )
+        size_lbl.pack(side=tk.TOP, fill=tk.X, pady=(4, 1))
 
-        self._create_format_cards()
+        # Resolution & PSNR readout
+        metrics_lbl = tk.Label(
+            card,
+            text="Res: — | PSNR: —",
+            font=("Helvetica", 10),
+            fg=self.FG_PRIMARY,
+            bg=self.BG_CARD,
+            anchor="w",
+        )
+        metrics_lbl.pack(side=tk.TOP, fill=tk.X, pady=1)
 
-    def _create_format_cards(self) -> None:
-        """Create a visual comparison card in the grid for each registered codec."""
+        # Tuned parameters summary
+        params_lbl = tk.Label(
+            card,
+            text="Params: —",
+            font=("Courier", 9),
+            fg=self.FG_SECONDARY,
+            bg=self.BG_CARD,
+            anchor="w",
+            justify=tk.LEFT,
+        )
+        params_lbl.pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
+
+        hint_lbl = tk.Label(
+            card,
+            text="Click image to inspect • Use tabs below or ← / → arrow keys to switch codec",
+            font=("Helvetica", 8),
+            fg=self.FG_SECONDARY,
+            bg=self.BG_CARD,
+            anchor="w",
+        )
+        hint_lbl.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+
+        self._single_widgets = {
+            "card": card,
+            "name_lbl": name_lbl,
+            "badge_lbl": badge_lbl,
+            "img_lbl": img_lbl,
+            "size_lbl": size_lbl,
+            "metrics_lbl": metrics_lbl,
+            "params_lbl": params_lbl,
+        }
+
+    def _create_tab_bar(self) -> None:
+        """Create equal-sized bottom tabs, one per codec, each with a nav checkbox."""
         tk = self.tk
         for idx, spec in enumerate(self.formats):
-            row = idx // self._grid_columns
-            col = idx % self._grid_columns
+            # uniform="codec_tabs" keeps every tab cell exactly equal width.
+            self.tab_bar.grid_columnconfigure(idx, weight=1, uniform="codec_tabs")
 
-            card = tk.Frame(
-                self.grid_container,
-                bg=self.BG_CARD,
-                highlightbackground="#334155",
-                highlightthickness=1,
-                padx=10,
-                pady=8,
-            )
-            card.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
-            self.grid_container.grid_columnconfigure(col, weight=1)
+            cell = tk.Frame(self.tab_bar, bg=self.BG_PANEL, padx=2, pady=2)
+            cell.grid(row=0, column=idx, sticky="nsew")
 
-            # Card header: Format name + Optimization strategy badge
-            hdr = tk.Frame(card, bg=self.BG_CARD)
-            hdr.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
-
-            name_lbl = tk.Label(
-                hdr,
+            tab_btn = tk.Button(
+                cell,
                 text=spec.name,
-                font=("Helvetica", 11, "bold"),
-                fg=self.FG_PRIMARY,
-                bg=self.BG_CARD,
-            )
-            name_lbl.pack(side=tk.LEFT)
-
-            badge_text = (
-                "1D Binary Search"
-                if spec.is_single_parameter
-                else f"{len(spec.parameters)}D Multi-Param"
-            )
-            badge_lbl = tk.Label(
-                hdr,
-                text=badge_text,
-                font=("Helvetica", 8),
-                fg=self.ACCENT_BLUE,
+                command=lambda fid=spec.id: self.select_format(fid),
                 bg="#0f172a",
-                padx=6,
-                pady=2,
-            )
-            badge_lbl.pack(side=tk.RIGHT)
-
-            # Image canvas area
-            img_lbl = tk.Label(
-                card,
-                bg="#090d16",
-                width=self._preview_max_size[0],
-                height=self._preview_max_size[1],
-                text="Optimizing...",
                 fg=self.FG_SECONDARY,
-                font=("Helvetica", 9),
-                cursor="hand2",
+                activebackground="#334155",
+                activeforeground=self.FG_PRIMARY,
+                relief=tk.FLAT,
+                padx=4,
+                pady=8,
+                font=("Helvetica", 9, "bold"),
+                wraplength=140,
             )
-            img_lbl.pack(side=tk.TOP, pady=4)
-            img_lbl.bind(
-                "<Button-1>",
-                lambda _e, fid=spec.id: self._open_inspector_modal(fid),
-            )
+            tab_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
 
-            # Size & Budget utilization readout
-            size_lbl = tk.Label(
-                card,
-                text="Size: —",
-                font=("Courier", 10, "bold"),
-                fg=self.ACCENT_GREEN,
-                bg=self.BG_CARD,
-                anchor="w",
-            )
-            size_lbl.pack(side=tk.TOP, fill=tk.X, pady=(4, 1))
-
-            # Resolution & PSNR readout
-            metrics_lbl = tk.Label(
-                card,
-                text="Res: — | PSNR: —",
-                font=("Helvetica", 9),
-                fg=self.FG_PRIMARY,
-                bg=self.BG_CARD,
-                anchor="w",
-            )
-            metrics_lbl.pack(side=tk.TOP, fill=tk.X, pady=1)
-
-            # Tuned parameters summary
-            params_lbl = tk.Label(
-                card,
-                text="Params: —",
-                font=("Courier", 8),
+            # Checked => this tab is skipped by Left/Right navigation only.
+            # The format itself stays fully optimized and clickable.
+            skip_var = tk.BooleanVar(value=False)
+            self.disabledForNavigation[spec.id] = skip_var
+            skip_chk = tk.Checkbutton(
+                cell,
+                text="skip",
+                variable=skip_var,
+                bg=self.BG_PANEL,
                 fg=self.FG_SECONDARY,
-                bg=self.BG_CARD,
-                anchor="w",
-                wraplength=255,
-                justify=tk.LEFT,
+                selectcolor="#0f172a",
+                activebackground=self.BG_PANEL,
+                activeforeground=self.FG_PRIMARY,
+                relief=tk.FLAT,
+                padx=2,
+                font=("Helvetica", 8),
             )
-            params_lbl.pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
+            skip_chk.pack(side=tk.RIGHT)
 
-            self._card_widgets[spec.id] = {
-                "card": card,
-                "img_lbl": img_lbl,
-                "size_lbl": size_lbl,
-                "metrics_lbl": metrics_lbl,
-                "params_lbl": params_lbl,
+            self._tab_widgets[spec.id] = {
+                "cell": cell,
+                "button": tab_btn,
+                "skip_check": skip_chk,
             }
+
+        self._refresh_tab_styles()
+        # Show placeholder header for the initially selected format.
+        self._show_placeholder_for_active()
+
+    def select_format(self, format_id: str) -> None:
+        """Show the optimized result for `format_id` in the single-view area."""
+        known_ids = {s.id for s in self.formats}
+        if format_id not in known_ids:
+            return
+        self.active_format_id = format_id
+        self._refresh_tab_styles()
+        res = self._latest_results.get(format_id)
+        if res is not None:
+            self._render_single_result(res)
+        else:
+            self._show_placeholder_for_active()
+
+    def _refresh_tab_styles(self) -> None:
+        """Highlight the active tab; leave all others in the idle style."""
+        for fid, widgets in self._tab_widgets.items():
+            btn = widgets["button"]
+            if fid == self.active_format_id:
+                btn.configure(bg="#0284c7", fg=self.FG_PRIMARY)
+            else:
+                btn.configure(bg="#0f172a", fg=self.FG_SECONDARY)
+
+    def _show_placeholder_for_active(self) -> None:
+        spec = next(
+            (s for s in self.formats if s.id == self.active_format_id),
+            self.formats[0] if self.formats else None,
+        )
+        if spec is None or not self._single_widgets:
+            return
+        badge_text = (
+            "1D Binary Search"
+            if spec.is_single_parameter
+            else f"{len(spec.parameters)}D Multi-Param"
+        )
+        self._single_widgets["name_lbl"].configure(text=spec.name)
+        self._single_widgets["badge_lbl"].configure(text=badge_text)
+        self._single_widgets["img_lbl"].configure(image="", text="Optimizing...")
+        self._single_widgets["size_lbl"].configure(text="Size: —")
+        self._single_widgets["metrics_lbl"].configure(text="Res: — | PSNR: —")
+        self._single_widgets["params_lbl"].configure(text="Params: —")
+
+    def _is_navigation_skipped(self, format_id: str) -> bool:
+        var = self.disabledForNavigation.get(format_id)
+        if var is None:
+            return False
+        try:
+            return bool(var.get())
+        except Exception:
+            return bool(var)
+
+    def _navigate_tabs(self, direction: int) -> None:
+        """Move selection left (-1) or right (+1), skipping skipped tabs, wrapping."""
+        if not self.formats:
+            return
+        ids = [s.id for s in self.formats]
+        try:
+            cur_idx = ids.index(self.active_format_id)  # type: ignore[arg-type]
+        except ValueError:
+            cur_idx = 0 if direction > 0 else len(ids) - 1
+        for step in range(1, len(ids) + 1):
+            nxt_idx = (cur_idx + direction * step) % len(ids)
+            candidate = ids[nxt_idx]
+            if not self._is_navigation_skipped(candidate):
+                self.select_format(candidate)
+                return
+        # Every tab is skipped: keep the current selection.
+
+    def _on_left_arrow(self, event: Any = None) -> Optional[str]:
+        if self._arrow_key_in_text_entry():
+            return None
+        self._navigate_tabs(-1)
+        return "break"
+
+    def _on_right_arrow(self, event: Any = None) -> Optional[str]:
+        if self._arrow_key_in_text_entry():
+            return None
+        self._navigate_tabs(1)
+        return "break"
+
+    def _arrow_key_in_text_entry(self) -> bool:
+        try:
+            focused = self.root.focus_get()
+            if focused is not None and focused.winfo_class() in (
+                "Entry",
+                "TEntry",
+                "TCombobox",
+                "Text",
+            ):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _open_active_inspector(self) -> None:
+        if self.active_format_id is not None:
+            self._open_inspector_modal(self.active_format_id)
 
     def _format_source_info(self) -> str:
         w, h = self.source_image.size
@@ -581,18 +743,6 @@ class FormatCompareApp:
             f"Source: {self.image_label}  |  {w}×{h} px  |  "
             f"Input Size: {format_byte_size(self.input_file_size)}"
         )
-
-    def _on_canvas_resize(self, event: Any) -> None:
-        self.canvas.itemconfig(self._canvas_window, width=event.width)
-        new_cols = max(2, min(4, event.width // 300))
-        if new_cols != self._grid_columns:
-            self._grid_columns = new_cols
-            for idx, spec in enumerate(self.formats):
-                card = self._card_widgets[spec.id]["card"]
-                card.grid_configure(
-                    row=idx // self._grid_columns,
-                    column=idx % self._grid_columns,
-                )
 
     def _on_slider_moved(self, raw_val: str) -> None:
         target = int(float(raw_val))
@@ -685,7 +835,7 @@ class FormatCompareApp:
         threading.Thread(target=_bg_runner, daemon=True).start()
 
     def _poll_result_queue(self) -> None:
-        """Drain completed `OptimizationResult` objects and update UI cards."""
+        """Drain completed `OptimizationResult` objects and update single view."""
         try:
             while True:
                 gen_id, res, is_done_sentinel = self._result_queue.get_nowait()
@@ -694,7 +844,7 @@ class FormatCompareApp:
                 if is_done_sentinel:
                     elapsed = (time.perf_counter() - self._run_start_time) * 1000.0
                     self.status_var.set(
-                        f"All {len(self.formats)} codecs optimized in {elapsed:.0f} ms (click any card to inspect)."
+                        f"All {len(self.formats)} codecs optimized in {elapsed:.0f} ms (click image to inspect, use tabs or ←/→)."
                     )
                     continue
                 self._latest_results[res.format_id] = res
@@ -703,21 +853,81 @@ class FormatCompareApp:
                 if self._completed_in_run == len(self.formats):
                     elapsed = (time.perf_counter() - self._run_start_time) * 1000.0
                     self.status_var.set(
-                        f"All {len(self.formats)} codecs optimized in {elapsed:.0f} ms (click any card to inspect)."
+                        f"All {len(self.formats)} codecs optimized in {elapsed:.0f} ms (click image to inspect, use tabs or ←/→)."
                     )
         except queue.Empty:
             pass
         finally:
             self.root.after(25, self._poll_result_queue)
 
-    def _render_preview_photo(self, decoded_img: Image.Image) -> Any:
+    def _get_available_preview_size(self) -> Tuple[int, int]:
+        """Return the current pixel box available for the preview photo.
+
+        Measured live from the image label so the preview fills whatever
+        window size the user gives it. Falls back to the card / window size
+        while the layout is still settling (winfo_width/height == 1).
         """
-        Upscale a decoded (potentially downscaled) codec image back to the
-        source aspect ratio inside `self._preview_max_size` so resolution loss
-        and compression artifacts can be compared side by side.
+        pad = 8
+        w, h = 0, 0
+        try:
+            lbl = self._single_widgets.get("img_lbl")
+            if lbl is not None and lbl.winfo_exists():
+                w, h = lbl.winfo_width(), lbl.winfo_height()
+        except Exception:
+            w, h = 0, 0
+        if w < 50 or h < 50:
+            try:
+                card = self._single_widgets.get("card")
+                if card is not None and card.winfo_exists():
+                    w, h = card.winfo_width() - pad, card.winfo_height() - 140
+            except Exception:
+                pass
+        if w < 50 or h < 50:
+            try:
+                w, h = self.root.winfo_width() - 60, self.root.winfo_height() - 380
+            except Exception:
+                pass
+        return (max(80, int(w - pad)), max(80, int(h - pad)))
+
+    def _on_preview_resize(self, event: Any = None) -> None:
+        """Debounced re-render of the active result when the view size changes."""
+        if self._preview_resize_after_id is not None:
+            try:
+                self.root.after_cancel(self._preview_resize_after_id)
+            except Exception:
+                pass
+            self._preview_resize_after_id = None
+
+        def _do_resize() -> None:
+            self._preview_resize_after_id = None
+            res = self._latest_results.get(self.active_format_id or "")
+            if res is None or res.decoded_image is None:
+                return
+            box = self._get_available_preview_size()
+            last = self._last_preview_box
+            # Ignore tiny <8px jitter so re-rendering the photo can't loop.
+            if last is not None and abs(box[0] - last[0]) < 8 and abs(box[1] - last[1]) < 8:
+                return
+            self._render_single_result(res)
+
+        self._preview_resize_after_id = self.root.after(80, _do_resize)
+
+    def _render_preview_photo(
+        self, decoded_img: Image.Image, max_w: Optional[int] = None, max_h: Optional[int] = None
+    ) -> Any:
         """
+        Fit a decoded codec image into the currently available display space
+        (preserving the source aspect ratio) so resolution loss and compression
+        artifacts can be compared across codecs at any window size.
+        """
+        if max_w is None or max_h is None:
+            avail_w, avail_h = self._get_available_preview_size()
+            max_w = avail_w if max_w is None else max_w
+            max_h = avail_h if max_h is None else max_h
+        max_w, max_h = max(80, int(max_w)), max(80, int(max_h))
+        self._last_preview_box = (max_w, max_h)
+
         src_w, src_h = self.source_image.size
-        max_w, max_h = self._preview_max_size
         fit_ratio = min(max_w / max(1, src_w), max_h / max(1, src_h))
         disp_w = max(1, int(round(src_w * fit_ratio)))
         disp_h = max(1, int(round(src_h * fit_ratio)))
@@ -731,9 +941,27 @@ class FormatCompareApp:
         return self.ImageTk.PhotoImage(disp_img)
 
     def _update_card(self, res: OptimizationResult) -> None:
-        widgets = self._card_widgets.get(res.format_id)
+        # Backend-compat alias: single-view mode only re-renders when the
+        # result belongs to the currently selected tab.
+        if res.format_id != self.active_format_id:
+            return
+        self._render_single_result(res)
+
+    def _render_single_result(self, res: OptimizationResult) -> None:
+        widgets = self._single_widgets
         if not widgets:
             return
+
+        spec = next((s for s in self.formats if s.id == res.format_id), None)
+        badge_text = ""
+        if spec is not None:
+            badge_text = (
+                "1D Binary Search"
+                if spec.is_single_parameter
+                else f"{len(spec.parameters)}D Multi-Param"
+            )
+        widgets["name_lbl"].configure(text=res.format_name)
+        widgets["badge_lbl"].configure(text=badge_text)
 
         if res.decoded_image is not None:
             photo = self._render_preview_photo(res.decoded_image)
@@ -770,8 +998,9 @@ class FormatCompareApp:
         )
 
     def _refresh_all_previews(self) -> None:
-        for res in self._latest_results.values():
-            self._update_card(res)
+        res = self._latest_results.get(self.active_format_id or "")
+        if res is not None:
+            self._render_single_result(res)
 
     def _open_inspector_modal(self, format_id: str) -> None:
         """Open a side-by-side Original vs Compressed zoom inspector dialog."""
