@@ -1,6 +1,6 @@
 # Format Compare Visual
 
-A modular Python & Tkinter application that compares how different image codecs (**JPEG**, **WebP Lossy**, **WebP Lossless**, **PNG**, **PNG-8 Palette**, **JPEG 2000**, **GIF**, and **TIFF**) visually render an input image when constrained to an exact **target file size budget**.
+A modular Python & Tkinter application that compares how different image codecs (**JPEG**, **WebP Lossy**, **WebP Lossless**, **PNG**, **PNG-8 Palette**, **JPEG 2000**, **JPEG XL**, **GIF**, and **TIFF**) visually render an input image when constrained to an exact **target file size budget**.
 
 ## Project Architecture
 
@@ -20,6 +20,7 @@ A modular Python & Tkinter application that compares how different image codecs 
 | `png` | **PNG (Lossless)** | `optimize=True` | `scale ∈ (0, 1]` | 1D Binary Search |
 | `png_quantized` | **PNG-8 (Palette)** | `optimize=True` | `scale ∈ (0, 1]`, `colors ∈ [2, 256]`, `dither ∈ {0, 1}` | Multi-Param Frontier + Coordinate Polish |
 | `jpeg2000` | **JPEG 2000** | `quality_mode='dB', irreversible=True` | `scale ∈ (0, 1]`, `target_psnr_db ∈ [18.0, 58.0]` | Multi-Param Frontier + Coordinate Polish |
+| `jxl` | **JPEG XL** | `effort=3` | `scale ∈ (0, 1]`, `quality ∈ [1, 100]` | Multi-Param Frontier + Coordinate Polish |
 | `gif` | **GIF** | `optimize=True` | `scale ∈ (0, 1]`, `colors ∈ [2, 256]` | Multi-Param Frontier + Coordinate Polish |
 | `tiff` | **TIFF (Deflate)** | `compression='tiff_adobe_deflate'` | `scale ∈ (0, 1]` | 1D Binary Search |
 

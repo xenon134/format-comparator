@@ -16,10 +16,91 @@ Adding a new format requires only calling `register_format(FormatSpec(...))`.
 from __future__ import annotations
 
 import io
+import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from PIL import Image
 
+
+
+def _init_jxl_support() -> bool:
+    """Initialize JPEG XL support via pillow_jxl or CLI tools (cjxl/djxl)."""
+    try:
+        import pillow_jxl  # noqa: F401
+        return True
+    except ImportError:
+        pass
+
+    cjxl_bin = shutil.which("cjxl")
+    djxl_bin = shutil.which("djxl")
+    if cjxl_bin and djxl_bin:
+        from PIL import ImageFile
+
+        def _save_jxl_cli(im: Image.Image, fp: Any, filename: Any, **kwargs: Any) -> None:
+            quality = kwargs.get("quality", 90)
+            effort = kwargs.get("effort", 3)
+            lossless = kwargs.get("lossless", False)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_in:
+                tmp_in_name = tmp_in.name
+            with tempfile.NamedTemporaryFile(suffix=".jxl", delete=False) as tmp_out:
+                tmp_out_name = tmp_out.name
+            try:
+                im.save(tmp_in_name, format="PNG")
+                cmd = [cjxl_bin, tmp_in_name, tmp_out_name, "-e", str(effort), "--quiet"]
+                if lossless or quality >= 100:
+                    cmd.extend(["-d", "0"])
+                else:
+                    cmd.extend(["-q", str(quality)])
+                subprocess.run(cmd, check=True)
+                with open(tmp_out_name, "rb") as f:
+                    fp.write(f.read())
+            finally:
+                for p in (tmp_in_name, tmp_out_name):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
+        class JXLCliImageFile(ImageFile.ImageFile):
+            format = "JXL"
+            format_description = "JPEG XL (via djxl)"
+
+            def _open(self) -> None:
+                with tempfile.NamedTemporaryFile(suffix=".jxl", delete=False) as tmp_in:
+                    tmp_in_name = tmp_in.name
+                    tmp_in.write(self.fp.read())
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_out:
+                    tmp_out_name = tmp_out.name
+                try:
+                    subprocess.run([djxl_bin, tmp_in_name, tmp_out_name, "--quiet"], check=True)
+                    dec = Image.open(tmp_out_name)
+                    self._size = dec.size
+                    self._mode = dec.mode
+                    self.tile = []
+                    self._loaded_img = dec.copy()
+                finally:
+                    for p in (tmp_in_name, tmp_out_name):
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+
+            def load(self) -> Any:
+                if hasattr(self, "_loaded_img"):
+                    self.im = self._loaded_img.im
+                return super().load()
+
+        Image.register_extension("JXL", ".jxl")
+        Image.register_save("JXL", _save_jxl_cli)
+        Image.register_open("JXL", JXLCliImageFile)
+        return True
+    return False
+
+
+_init_jxl_support()
 
 ParameterKind = Literal["float", "int", "choice"]
 
@@ -319,6 +400,20 @@ def _preprocess_jpeg2000(
     return img, {"quality_layers": [target_db]}
 
 
+def _preprocess_jxl(
+    img: Image.Image, codec_params: Dict[str, Any]
+) -> Tuple[Image.Image, Dict[str, Any]]:
+    """Prepare image and options for JPEG XL encoding."""
+    if img.mode not in ("RGB", "RGBA", "L", "LA", "I;16", "F"):
+        img = img.convert(
+            "RGBA" if "transparency" in img.info or "A" in img.mode else "RGB"
+        )
+    quality = int(codec_params.get("quality", 95))
+    if quality >= 100:
+        return img, {"lossless": True, "quality": 100}
+    return img, {"lossless": False, "quality": quality}
+
+
 # ============================================================================
 # Format Registry & Built-In Format Definitions
 # ============================================================================
@@ -498,7 +593,33 @@ def _register_builtin_formats() -> None:
         )
     )
 
-    # 7. GIF — scale in (0, 1], colors in [2, 256]
+    # 7. JPEG XL — scale in (0, 1], quality in [1, 100]
+    register_format(
+        FormatSpec(
+            id="jxl",
+            name="JPEG XL",
+            pil_format="JXL",
+            extension=".jxl",
+            fixed_options={"effort": 3},
+            supports_alpha=True,
+            preprocess_hook=_preprocess_jxl,
+            parameters=(
+                DEFAULT_SCALE_PARAMETER,
+                ParameterSpec(
+                    name="quality",
+                    kind="int",
+                    min_val=1,
+                    max_val=100,
+                    default=95,
+                    monotonic_with_size=True,
+                    description="JPEG XL compression quality factor [1, 100].",
+                ),
+            ),
+            description="Next-generation JPEG XL codec; tunes scale and quality [1..100].",
+        )
+    )
+
+    # 8. GIF — scale in (0, 1], colors in [2, 256]
     register_format(
         FormatSpec(
             id="gif",
@@ -524,7 +645,7 @@ def _register_builtin_formats() -> None:
         )
     )
 
-    # 8. TIFF (Adobe Deflate) — single tunable parameter: scale in (0, 1]
+    # 9. TIFF (Adobe Deflate) — single tunable parameter: scale in (0, 1]
     register_format(
         FormatSpec(
             id="tiff",

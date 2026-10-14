@@ -564,7 +564,6 @@ class FormatCompareApp:
             self.disabledForNavigation[spec.id] = skip_var
             skip_chk = tk.Checkbutton(
                 cell,
-                text="skip",
                 variable=skip_var,
                 bg=self.BG_PANEL,
                 fg=self.FG_SECONDARY,
@@ -573,7 +572,6 @@ class FormatCompareApp:
                 activeforeground=self.FG_PRIMARY,
                 relief=tk.FLAT,
                 padx=2,
-                font=("Helvetica", 8),
             )
             skip_chk.pack(side=tk.RIGHT)
 
